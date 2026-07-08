@@ -7,6 +7,7 @@ const rooms = new Map();
 const EMPTY_STATE = {
   players: { RED: null, BLACK: null },
   moves: [],
+  pendingAction: null,
   status: "PLAYING",
   updatedAt: 0,
 };
@@ -126,6 +127,7 @@ function move(roomId, room, playerId, moveData) {
     toRow: moveData.toRow,
     toCol: moveData.toCol,
   });
+  room.pendingAction = null;
   room.updatedAt = Date.now();
   return snapshot(roomId, room, playerId, side, "已同步");
 }
@@ -136,19 +138,18 @@ function action(roomId, room, playerId, actionName) {
     throw new Error("玩家不在房间中");
   }
 
-  if (actionName === "resign") {
-    room.status = side === "RED" ? "BLACK_WIN" : "RED_WIN";
-  } else if (actionName === "draw") {
-    room.status = "DRAW";
-  } else if (actionName === "reset") {
-    room.moves = [];
-    room.status = "PLAYING";
+  if (["undo", "draw", "resign", "reset"].includes(actionName)) {
+    requestAction(room, side, actionName);
+  } else if (actionName === "accept") {
+    acceptAction(room, side);
+  } else if (actionName === "reject") {
+    rejectAction(room, side);
   } else {
     throw new Error("动作无效");
   }
 
   room.updatedAt = Date.now();
-  return snapshot(roomId, room, playerId, side, "已同步");
+  return snapshot(roomId, room, playerId, side);
 }
 
 function snapshot(roomId, room, playerId, knownSide) {
@@ -163,9 +164,89 @@ function snapshot(roomId, room, playerId, knownSide) {
     side,
     status: room.status,
     moves: room.moves,
+    pendingAction: room.pendingAction,
     playerCount: playerCount(room),
-    message: playerCount(room) < 2 ? "等待对手加入" : "已连接",
+    message: snapshotMessage(room, side),
   };
+}
+
+function requestAction(room, side, type) {
+  if (playerCount(room) < 2) {
+    throw new Error("等待对手加入");
+  }
+  if (type !== "reset" && room.status !== "PLAYING") {
+    throw new Error("棋局已结束");
+  }
+  if (type === "undo") {
+    if (room.moves.length === 0) {
+      throw new Error("没有可悔棋步");
+    }
+    if (lastMoveSide(room.moves.length) !== side) {
+      throw new Error("只能请求撤回自己的上一步");
+    }
+  }
+
+  room.pendingAction = {
+    type,
+    requester: side,
+    target: oppositeSide(side),
+    createdAt: Date.now(),
+  };
+}
+
+function acceptAction(room, side) {
+  const pending = room.pendingAction;
+  if (!pending) {
+    throw new Error("没有待处理请求");
+  }
+  if (pending.target !== side) {
+    throw new Error("只能由对方处理请求");
+  }
+
+  if (pending.type === "undo") {
+    room.moves.pop();
+    room.status = "PLAYING";
+  } else if (pending.type === "draw") {
+    room.status = "DRAW";
+  } else if (pending.type === "resign") {
+    room.status = pending.requester === "RED" ? "BLACK_WIN" : "RED_WIN";
+  } else if (pending.type === "reset") {
+    room.moves = [];
+    room.status = "PLAYING";
+  }
+  room.pendingAction = null;
+}
+
+function rejectAction(room, side) {
+  const pending = room.pendingAction;
+  if (!pending) {
+    throw new Error("没有待处理请求");
+  }
+  if (pending.target !== side && pending.requester !== side) {
+    throw new Error("只能由房间玩家处理请求");
+  }
+  room.pendingAction = null;
+}
+
+function snapshotMessage(room, side) {
+  if (playerCount(room) < 2) {
+    return "等待对手加入";
+  }
+  if (!room.pendingAction) {
+    return "已连接";
+  }
+  const label = actionLabel(room.pendingAction.type);
+  return room.pendingAction.target === side
+    ? `对方请求${label}`
+    : `等待对方处理${label}请求`;
+}
+
+function actionLabel(type) {
+  if (type === "undo") return "悔棋";
+  if (type === "draw") return "求和";
+  if (type === "resign") return "认输";
+  if (type === "reset") return "重置";
+  return "操作";
 }
 
 function normalizeRoomId(roomId) {
@@ -182,6 +263,14 @@ function findPlayerSide(room, playerId) {
 
 function turnSide(moveCount) {
   return moveCount % 2 === 0 ? "RED" : "BLACK";
+}
+
+function lastMoveSide(moveCount) {
+  return moveCount % 2 === 1 ? "RED" : "BLACK";
+}
+
+function oppositeSide(side) {
+  return side === "RED" ? "BLACK" : "RED";
 }
 
 function playerCount(room) {
