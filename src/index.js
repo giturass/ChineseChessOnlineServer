@@ -2,6 +2,8 @@ import http from "node:http";
 import { randomUUID } from "node:crypto";
 
 const PORT = Number(process.env.PORT || 10000);
+const PLAYER_TIMEOUT_MS = Number(process.env.PLAYER_TIMEOUT_MS || 90_000);
+const ROOM_TTL_MS = Number(process.env.ROOM_TTL_MS || 30 * 60_000);
 const rooms = new Map();
 
 const EMPTY_STATE = {
@@ -22,7 +24,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     const url = new URL(req.url || "/", `http://${req.headers.host || "localhost"}`);
-    const match = url.pathname.match(/^\/api\/rooms\/([^/]+)(?:\/(join|move|action))?$/);
+    const match = url.pathname.match(/^\/api\/rooms\/([^/]+)(?:\/(join|move|action|leave))?$/);
     if (!match) {
       send(res, 200, { ok: true, service: "ChineseChessOnline" });
       return;
@@ -55,6 +57,12 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (command === "leave" && req.method === "POST") {
+      const body = await readJson(req);
+      send(res, 200, leave(roomId, room, body.playerId));
+      return;
+    }
+
     if (command === "state" && req.method === "GET") {
       send(res, 200, snapshot(roomId, room, url.searchParams.get("playerId")));
       return;
@@ -70,6 +78,8 @@ server.listen(PORT, () => {
   console.log(`Chinese chess online server listening on ${PORT}`);
 });
 
+setInterval(cleanupRooms, Math.min(ROOM_TTL_MS, 60_000)).unref();
+
 function getRoom(roomId) {
   if (!rooms.has(roomId)) {
     rooms.set(roomId, {
@@ -79,35 +89,46 @@ function getRoom(roomId) {
       updatedAt: Date.now(),
     });
   }
-  return rooms.get(roomId);
+  const room = rooms.get(roomId);
+  pruneStalePlayers(room);
+  return room;
 }
 
 function join(roomId, room, requestedPlayerId) {
+  pruneStalePlayers(room);
+  if (playerCount(room) === 0) {
+    resetRoomState(room);
+  }
+
   let side = findPlayerSide(room, requestedPlayerId);
   let playerId = requestedPlayerId;
 
   if (!side) {
     playerId = randomUUID();
     if (!room.players.RED) {
-      room.players.RED = playerId;
+      setPlayer(room, "RED", playerId);
       side = "RED";
     } else if (!room.players.BLACK) {
-      room.players.BLACK = playerId;
+      setPlayer(room, "BLACK", playerId);
       side = "BLACK";
     } else {
       throw new Error("房间已满");
     }
     room.updatedAt = Date.now();
+  } else {
+    touchPlayer(room, playerId);
   }
 
   return snapshot(roomId, room, playerId, side);
 }
 
 function move(roomId, room, playerId, moveData) {
+  pruneStalePlayers(room, playerId);
   const side = findPlayerSide(room, playerId);
   if (!side) {
     throw new Error("玩家不在房间中");
   }
+  touchPlayer(room, playerId);
   if (room.status !== "PLAYING") {
     throw new Error("棋局已结束");
   }
@@ -133,10 +154,12 @@ function move(roomId, room, playerId, moveData) {
 }
 
 function action(roomId, room, playerId, actionName) {
+  pruneStalePlayers(room, playerId);
   const side = findPlayerSide(room, playerId);
   if (!side) {
     throw new Error("玩家不在房间中");
   }
+  touchPlayer(room, playerId);
 
   if (["undo", "draw", "resign", "reset"].includes(actionName)) {
     requestAction(room, side, actionName);
@@ -152,11 +175,28 @@ function action(roomId, room, playerId, actionName) {
   return snapshot(roomId, room, playerId, side);
 }
 
+function leave(roomId, room, playerId) {
+  const side = findPlayerSide(room, playerId);
+  if (side) {
+    room.players[side] = null;
+    if (room.pendingAction?.requester === side || room.pendingAction?.target === side) {
+      room.pendingAction = null;
+    }
+    room.updatedAt = Date.now();
+  }
+  if (playerCount(room) === 0) {
+    rooms.delete(roomId);
+  }
+  return { ok: true };
+}
+
 function snapshot(roomId, room, playerId, knownSide) {
+  pruneStalePlayers(room, playerId);
   const side = knownSide || findPlayerSide(room, playerId);
   if (!side) {
     throw new Error("玩家不在房间中");
   }
+  touchPlayer(room, playerId);
 
   return {
     roomId,
@@ -228,6 +268,13 @@ function rejectAction(room, side) {
   room.pendingAction = null;
 }
 
+function resetRoomState(room) {
+  room.moves = [];
+  room.pendingAction = null;
+  room.status = "PLAYING";
+  room.updatedAt = Date.now();
+}
+
 function snapshotMessage(room, side) {
   if (playerCount(room) < 2) {
     return "等待对手加入";
@@ -256,9 +303,49 @@ function normalizeRoomId(roomId) {
 
 function findPlayerSide(room, playerId) {
   if (!playerId) return null;
-  if (room.players.RED === playerId) return "RED";
-  if (room.players.BLACK === playerId) return "BLACK";
+  if (getPlayerId(room.players.RED) === playerId) return "RED";
+  if (getPlayerId(room.players.BLACK) === playerId) return "BLACK";
   return null;
+}
+
+function setPlayer(room, side, playerId) {
+  room.players[side] = {
+    id: playerId,
+    lastSeen: Date.now(),
+  };
+}
+
+function touchPlayer(room, playerId) {
+  const side = findPlayerSide(room, playerId);
+  if (!side) return;
+  const player = room.players[side];
+  if (typeof player === "string") {
+    setPlayer(room, side, player);
+  } else if (player) {
+    player.lastSeen = Date.now();
+  }
+  room.updatedAt = Date.now();
+}
+
+function pruneStalePlayers(room, activePlayerId = null) {
+  const now = Date.now();
+  for (const side of ["RED", "BLACK"]) {
+    const player = room.players[side];
+    if (!player || getPlayerId(player) === activePlayerId) continue;
+    const lastSeen = typeof player === "string" ? room.updatedAt : player.lastSeen;
+    if (now - lastSeen > PLAYER_TIMEOUT_MS) {
+      room.players[side] = null;
+      if (room.pendingAction?.requester === side || room.pendingAction?.target === side) {
+        room.pendingAction = null;
+      }
+      room.updatedAt = now;
+    }
+  }
+}
+
+function getPlayerId(player) {
+  if (!player) return null;
+  return typeof player === "string" ? player : player.id;
 }
 
 function turnSide(moveCount) {
@@ -274,7 +361,7 @@ function oppositeSide(side) {
 }
 
 function playerCount(room) {
-  return Number(Boolean(room.players.RED)) + Number(Boolean(room.players.BLACK));
+  return Number(Boolean(getPlayerId(room.players.RED))) + Number(Boolean(getPlayerId(room.players.BLACK)));
 }
 
 function validMoveShape(moveData) {
@@ -284,6 +371,16 @@ function validMoveShape(moveData) {
     moveData.toRow >= 0 && moveData.toRow <= 9 &&
     moveData.fromCol >= 0 && moveData.fromCol <= 8 &&
     moveData.toCol >= 0 && moveData.toCol <= 8;
+}
+
+function cleanupRooms() {
+  const now = Date.now();
+  for (const [roomId, room] of rooms) {
+    pruneStalePlayers(room);
+    if (playerCount(room) === 0 && now - room.updatedAt > ROOM_TTL_MS) {
+      rooms.delete(roomId);
+    }
+  }
 }
 
 function readJson(req) {
