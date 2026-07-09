@@ -41,7 +41,7 @@ const server = http.createServer(async (req, res) => {
 
     if (command === "join" && req.method === "POST") {
       const body = await readJson(req);
-      send(res, 200, join(roomId, room, body.playerId));
+      send(res, 200, join(roomId, room, body.playerId, body.preferredSide));
       return;
     }
 
@@ -94,7 +94,7 @@ function getRoom(roomId) {
   return room;
 }
 
-function join(roomId, room, requestedPlayerId) {
+function join(roomId, room, requestedPlayerId, preferredSide) {
   pruneStalePlayers(room);
   if (playerCount(room) === 0) {
     resetRoomState(room);
@@ -102,10 +102,17 @@ function join(roomId, room, requestedPlayerId) {
 
   let side = findPlayerSide(room, requestedPlayerId);
   let playerId = requestedPlayerId;
+  const requestedSide = normalizeSide(preferredSide);
 
   if (!side) {
     playerId = randomUUID();
-    if (!room.players.RED) {
+    if (requestedSide) {
+      if (room.players[requestedSide]) {
+        throw new Error("所选方已被占用");
+      }
+      setPlayer(room, requestedSide, playerId);
+      side = requestedSide;
+    } else if (!room.players.RED) {
       setPlayer(room, "RED", playerId);
       side = "RED";
     } else if (!room.players.BLACK) {
@@ -299,6 +306,11 @@ function actionLabel(type) {
 function normalizeRoomId(roomId) {
   const value = roomId.trim().toUpperCase();
   return /^[A-Z0-9_-]{1,24}$/.test(value) ? value : "";
+}
+
+function normalizeSide(side) {
+  const value = String(side || "").trim().toUpperCase();
+  return value === "RED" || value === "BLACK" ? value : null;
 }
 
 function findPlayerSide(room, playerId) {
