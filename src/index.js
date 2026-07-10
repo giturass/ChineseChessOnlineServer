@@ -4,6 +4,8 @@ import { randomUUID } from "node:crypto";
 const PORT = Number(process.env.PORT || 10000);
 const PLAYER_TIMEOUT_MS = Number(process.env.PLAYER_TIMEOUT_MS || 90_000);
 const ROOM_TTL_MS = Number(process.env.ROOM_TTL_MS || 30 * 60_000);
+const MAX_STATE_WAIT_MS = Number(process.env.MAX_STATE_WAIT_MS || 15_000);
+const MAX_WAITERS_PER_ROOM = Number(process.env.MAX_WAITERS_PER_ROOM || 20);
 const rooms = new Map();
 
 const EMPTY_STATE = {
@@ -11,6 +13,7 @@ const EMPTY_STATE = {
   moves: [],
   pendingAction: null,
   status: "PLAYING",
+  revision: 0,
   updatedAt: 0,
 };
 
@@ -64,7 +67,18 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (command === "state" && req.method === "GET") {
-      send(res, 200, snapshot(roomId, room, url.searchParams.get("playerId")));
+      const playerId = url.searchParams.get("playerId");
+      const sinceRevision = parseRevision(url.searchParams.get("since"));
+      const waitMs = parseWaitMs(url.searchParams.get("wait"));
+      let knownSide = null;
+      if (sinceRevision != null && waitMs > 0) {
+        knownSide = ensureRoomPlayer(room, playerId);
+        if (room.revision <= sinceRevision) {
+          await waitForRoomChange(res, room, sinceRevision, waitMs);
+          if (res.destroyed) return;
+        }
+      }
+      send(res, 200, snapshot(roomId, room, playerId, knownSide));
       return;
     }
 
@@ -86,6 +100,7 @@ function getRoom(roomId) {
       ...EMPTY_STATE,
       players: { ...EMPTY_STATE.players },
       moves: [],
+      waiters: [],
       updatedAt: Date.now(),
     });
   }
@@ -97,7 +112,7 @@ function getRoom(roomId) {
 function join(roomId, room, requestedPlayerId, preferredSide) {
   pruneStalePlayers(room);
   if (playerCount(room) === 0) {
-    resetRoomState(room);
+    resetRoomState(room, false);
   }
 
   let side = findPlayerSide(room, requestedPlayerId);
@@ -121,7 +136,7 @@ function join(roomId, room, requestedPlayerId, preferredSide) {
     } else {
       throw new Error("房间已满");
     }
-    room.updatedAt = Date.now();
+    bumpRoom(room);
   } else {
     touchPlayer(room, playerId);
   }
@@ -156,7 +171,7 @@ function move(roomId, room, playerId, moveData) {
     toCol: moveData.toCol,
   });
   room.pendingAction = null;
-  room.updatedAt = Date.now();
+  bumpRoom(room);
   return snapshot(roomId, room, playerId, side, "已同步");
 }
 
@@ -178,7 +193,7 @@ function action(roomId, room, playerId, actionName) {
     throw new Error("动作无效");
   }
 
-  room.updatedAt = Date.now();
+  bumpRoom(room);
   return snapshot(roomId, room, playerId, side);
 }
 
@@ -189,7 +204,7 @@ function leave(roomId, room, playerId) {
     if (room.pendingAction?.requester === side || room.pendingAction?.target === side) {
       room.pendingAction = null;
     }
-    room.updatedAt = Date.now();
+    bumpRoom(room);
   }
   if (playerCount(room) === 0) {
     rooms.delete(roomId);
@@ -198,21 +213,17 @@ function leave(roomId, room, playerId) {
 }
 
 function snapshot(roomId, room, playerId, knownSide) {
-  pruneStalePlayers(room, playerId);
-  const side = knownSide || findPlayerSide(room, playerId);
-  if (!side) {
-    throw new Error("玩家不在房间中");
-  }
-  touchPlayer(room, playerId);
+  const side = knownSide || ensureRoomPlayer(room, playerId);
 
   return {
     roomId,
     playerId,
     side,
     status: room.status,
-    moves: room.moves,
+    moves: room.moves.slice(),
     pendingAction: room.pendingAction,
     playerCount: playerCount(room),
+    revision: room.revision,
     message: snapshotMessage(room, side),
   };
 }
@@ -275,11 +286,15 @@ function rejectAction(room, side) {
   room.pendingAction = null;
 }
 
-function resetRoomState(room) {
+function resetRoomState(room, notify = true) {
   room.moves = [];
   room.pendingAction = null;
   room.status = "PLAYING";
-  room.updatedAt = Date.now();
+  if (notify) {
+    bumpRoom(room);
+  } else {
+    room.updatedAt = Date.now();
+  }
 }
 
 function snapshotMessage(room, side) {
@@ -341,6 +356,7 @@ function touchPlayer(room, playerId) {
 
 function pruneStalePlayers(room, activePlayerId = null) {
   const now = Date.now();
+  let changed = false;
   for (const side of ["RED", "BLACK"]) {
     const player = room.players[side];
     if (!player || getPlayerId(player) === activePlayerId) continue;
@@ -350,8 +366,11 @@ function pruneStalePlayers(room, activePlayerId = null) {
       if (room.pendingAction?.requester === side || room.pendingAction?.target === side) {
         room.pendingAction = null;
       }
-      room.updatedAt = now;
+      changed = true;
     }
+  }
+  if (changed) {
+    bumpRoom(room);
   }
 }
 
@@ -374,6 +393,82 @@ function oppositeSide(side) {
 
 function playerCount(room) {
   return Number(Boolean(getPlayerId(room.players.RED))) + Number(Boolean(getPlayerId(room.players.BLACK)));
+}
+
+function ensureRoomPlayer(room, playerId) {
+  pruneStalePlayers(room, playerId);
+  const side = findPlayerSide(room, playerId);
+  if (!side) {
+    throw new Error("玩家不在房间中");
+  }
+  touchPlayer(room, playerId);
+  return side;
+}
+
+function bumpRoom(room) {
+  room.revision += 1;
+  room.updatedAt = Date.now();
+  notifyWaiters(room);
+}
+
+function waitForRoomChange(res, room, sinceRevision, waitMs) {
+  if (room.revision > sinceRevision || waitMs <= 0) {
+    return Promise.resolve();
+  }
+  if (room.waiters.length >= MAX_WAITERS_PER_ROOM) {
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const waiter = { sinceRevision, finish: null };
+    let finished = false;
+    const timer = setTimeout(finish, waitMs);
+
+    function finish() {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      res.off("close", finish);
+      const index = room.waiters.indexOf(waiter);
+      if (index >= 0) {
+        room.waiters.splice(index, 1);
+      }
+      resolve();
+    }
+
+    waiter.finish = finish;
+    res.on("close", finish);
+    room.waiters.push(waiter);
+  });
+}
+
+function notifyWaiters(room) {
+  if (!room.waiters.length) return;
+  const pending = [];
+  const ready = [];
+  for (const waiter of room.waiters) {
+    if (room.revision > waiter.sinceRevision) {
+      ready.push(waiter);
+    } else {
+      pending.push(waiter);
+    }
+  }
+  room.waiters = pending;
+  for (const waiter of ready) {
+    waiter.finish();
+  }
+}
+
+function parseRevision(value) {
+  if (value == null || value === "") return null;
+  const revision = Number(value);
+  return Number.isSafeInteger(revision) && revision >= 0 ? revision : null;
+}
+
+function parseWaitMs(value) {
+  const wait = Number(value || 0);
+  if (!Number.isFinite(wait) || wait <= 0) return 0;
+  return Math.min(wait, MAX_STATE_WAIT_MS);
 }
 
 function validMoveShape(moveData) {
@@ -428,8 +523,10 @@ function setCorsHeaders(res) {
 }
 
 function send(res, status, body) {
+  if (res.destroyed) return;
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
   res.end(body == null ? "" : JSON.stringify(body));
 }
 
