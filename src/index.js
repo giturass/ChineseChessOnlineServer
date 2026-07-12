@@ -183,8 +183,12 @@ function action(roomId, room, playerId, actionName) {
   }
   touchPlayer(room, playerId);
 
-  if (["undo", "draw", "resign", "reset"].includes(actionName)) {
+  if (["undo", "draw"].includes(actionName)) {
     requestAction(room, side, actionName);
+  } else if (actionName === "resign") {
+    resign(room, side);
+  } else if (actionName === "reset") {
+    reset(room);
   } else if (actionName === "accept") {
     acceptAction(room, side);
   } else if (actionName === "reject") {
@@ -195,6 +199,24 @@ function action(roomId, room, playerId, actionName) {
 
   bumpRoom(room);
   return snapshot(roomId, room, playerId, side);
+}
+
+function resign(room, side) {
+  if (playerCount(room) < 2) {
+    throw new Error("等待对手加入");
+  }
+  if (room.status !== "PLAYING") {
+    throw new Error("棋局已结束");
+  }
+  room.status = side === "RED" ? "BLACK_WIN" : "RED_WIN";
+  room.pendingAction = null;
+}
+
+function reset(room) {
+  if (playerCount(room) < 2) {
+    throw new Error("等待对手加入");
+  }
+  resetRoomState(room, false);
 }
 
 function leave(roomId, room, playerId) {
@@ -232,7 +254,7 @@ function requestAction(room, side, type) {
   if (playerCount(room) < 2) {
     throw new Error("等待对手加入");
   }
-  if (type !== "reset" && room.status !== "PLAYING") {
+  if (room.status !== "PLAYING") {
     throw new Error("棋局已结束");
   }
   if (type === "undo") {
@@ -266,11 +288,6 @@ function acceptAction(room, side) {
     room.status = "PLAYING";
   } else if (pending.type === "draw") {
     room.status = "DRAW";
-  } else if (pending.type === "resign") {
-    room.status = pending.requester === "RED" ? "BLACK_WIN" : "RED_WIN";
-  } else if (pending.type === "reset") {
-    room.moves = [];
-    room.status = "PLAYING";
   }
   room.pendingAction = null;
 }
@@ -313,8 +330,6 @@ function snapshotMessage(room, side) {
 function actionLabel(type) {
   if (type === "undo") return "悔棋";
   if (type === "draw") return "求和";
-  if (type === "resign") return "认输";
-  if (type === "reset") return "重置";
   return "操作";
 }
 

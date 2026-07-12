@@ -28,7 +28,7 @@ Rooms are kept in process memory. For one Render instance this is enough for lig
 - `POST /api/rooms/{roomId}/move`
 - `POST /api/rooms/{roomId}/action`
 
-`action` accepts `undo`, `draw`, `resign`, and `reset` as requests. The opponent then sends `accept` or `reject`.
+`undo` and `draw` create requests that the opponent accepts or rejects. `resign` and `reset` take effect immediately after the initiating player confirms them locally.
 
 ## License
 
