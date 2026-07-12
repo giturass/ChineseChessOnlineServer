@@ -438,9 +438,6 @@ function snapshotMessage(room, side) {
   if (playerCount(room) < 2) {
     return "等待对手加入";
   }
-  if (room.actionReceipt?.accepted && room.actionReceipt.requester === side) {
-    return room.actionReceipt.type === "undo" ? "对方已同意悔棋" : "对方已同意和棋";
-  }
   if (!room.pendingAction) {
     return "已连接";
   }
