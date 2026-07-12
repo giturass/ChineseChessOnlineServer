@@ -30,6 +30,14 @@ Rooms are kept in process memory. For one Render instance this is enough for lig
 
 `undo` and `draw` create requests that the opponent accepts or rejects. `resign` and `reset` take effect immediately after the initiating player confirms them locally.
 
+Move and action requests include a unique `requestId` and the client's `expectedRevision`. Duplicate requests are idempotent, while stale revisions return `REVISION_CONFLICT`.
+
+State requests may include `fromMove`. Responses contain `moveOffset` and `totalMoves`, allowing clients to apply only new moves instead of downloading the full history every poll.
+
+The server validates piece movement, flying generals, self-check, checkmate, stalemate, repeated positions, turn order, and the configured maximum game length.
+
+Important error codes include `ROOM_NOT_FOUND`, `SESSION_EXPIRED`, `REVISION_CONFLICT`, `INVALID_MOVE`, and `ACTION_PENDING`.
+
 ## License
 
 MIT
