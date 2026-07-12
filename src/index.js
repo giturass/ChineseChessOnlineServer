@@ -17,6 +17,7 @@ const MAX_ROOMS = envInteger("MAX_ROOMS", 10_000, 1, 100_000);
 const MAX_MOVES_PER_GAME = envInteger("MAX_MOVES_PER_GAME", 600, 20, 10_000);
 const MAX_REQUEST_IDS_PER_ROOM = envInteger("MAX_REQUEST_IDS_PER_ROOM", 256, 16, 4096);
 const PENDING_ACTION_TTL_MS = envInteger("PENDING_ACTION_TTL_MS", 60_000, 5_000, 10 * 60_000);
+const ACTION_RECEIPT_TTL_MS = envInteger("ACTION_RECEIPT_TTL_MS", 60_000, 5_000, 10 * 60_000);
 const rooms = new Map();
 
 const server = http.createServer(async (req, res) => {
@@ -142,6 +143,7 @@ function createRoom() {
     requestIds: new Map(),
     requestOrder: [],
     pendingAction: null,
+    actionReceipt: null,
     status: "PLAYING",
     revision: 0,
     waiters: [],
@@ -203,6 +205,9 @@ function move(roomId, room, body) {
   }
   if (room.pendingAction) {
     throw new ApiError("ACTION_PENDING", "请先处理待确认请求", 409);
+  }
+  if (Number.isSafeInteger(body.baseMoveCount) && body.baseMoveCount !== room.moves.length) {
+    throw new ApiError("STATE_OUTDATED", "棋局状态已更新，请同步后重试", 409);
   }
   if (!validMoveShape(moveData)) {
     throw new ApiError("INVALID_MOVE", "走法数据无效", 422);
@@ -310,6 +315,7 @@ function snapshot(roomId, room, playerId, knownSide, fromMove = 0) {
     moveOffset,
     totalMoves: room.moves.length,
     pendingAction: room.pendingAction,
+    actionReceipt: room.actionReceipt,
     playerCount: playerCount(room),
     revision: room.revision,
     message: snapshotMessage(room, side),
@@ -335,6 +341,7 @@ function requestAction(room, side, type) {
     }
   }
 
+  room.actionReceipt = null;
   room.pendingAction = {
     type,
     requester: side,
@@ -358,6 +365,14 @@ function acceptAction(room, side) {
   } else if (pending.type === "draw") {
     room.status = "DRAW";
   }
+  room.actionReceipt = {
+    id: randomUUID(),
+    type: pending.type,
+    requester: pending.requester,
+    responder: side,
+    accepted: true,
+    createdAt: Date.now(),
+  };
   room.pendingAction = null;
 }
 
@@ -378,6 +393,7 @@ function resetRoomState(room, notify = true) {
   room.board = board;
   room.positionCounts = new Map([[positionKey(board, "RED"), 1]]);
   room.pendingAction = null;
+  room.actionReceipt = null;
   room.status = "PLAYING";
   if (notify) {
     bumpRoom(room);
@@ -421,6 +437,9 @@ function rebuildRoomGame(room) {
 function snapshotMessage(room, side) {
   if (playerCount(room) < 2) {
     return "等待对手加入";
+  }
+  if (room.actionReceipt?.accepted && room.actionReceipt.requester === side) {
+    return room.actionReceipt.type === "undo" ? "对方已同意悔棋" : "对方已同意和棋";
   }
   if (!room.pendingAction) {
     return "已连接";
@@ -476,6 +495,7 @@ function touchPlayer(room, playerId) {
 function maintainRoom(room) {
   pruneStalePlayers(room);
   expirePendingAction(room);
+  expireActionReceipt(room);
 }
 
 function pruneStalePlayers(room) {
@@ -502,6 +522,12 @@ function expirePendingAction(room, now = Date.now()) {
   if (!room.pendingAction || now - room.pendingAction.createdAt <= PENDING_ACTION_TTL_MS) return false;
   room.pendingAction = null;
   bumpRoom(room);
+  return true;
+}
+
+function expireActionReceipt(room, now = Date.now()) {
+  if (!room.actionReceipt || now - room.actionReceipt.createdAt <= ACTION_RECEIPT_TTL_MS) return false;
+  room.actionReceipt = null;
   return true;
 }
 
@@ -547,16 +573,7 @@ function prepareMutation(room, playerId, requestId, expectedRevision) {
   if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 0) {
     throw new ApiError("INVALID_REVISION", "状态版本无效", 400);
   }
-  const requestKey = `${playerId}:${requestId}`;
-  if (!room.requestIds.has(requestKey) && expectedRevision !== room.revision) {
-    throw new ApiError(
-      "REVISION_CONFLICT",
-      "棋局状态已更新，请同步后重试",
-      409,
-      { currentRevision: room.revision },
-    );
-  }
-  return requestKey;
+  return `${playerId}:${requestId}`;
 }
 
 function rememberRequest(room, requestKey) {
