@@ -1,5 +1,6 @@
 import http from "node:http";
 import { randomUUID } from "node:crypto";
+import { normalizeActionName } from "./actions.js";
 import {
   applyLegalMove,
   createInitialBoard,
@@ -33,7 +34,12 @@ const server = http.createServer(async (req, res) => {
     const match = url.pathname.match(/^\/api\/rooms\/([^/]+)(?:\/(join|move|action|leave))?$/);
     if (!match) {
       if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/health")) {
-        send(res, 200, { ok: true, service: "ChineseChessOnline" });
+        send(res, 200, {
+          ok: true,
+          service: "ChineseChessOnline",
+          version: "1.2.0",
+          actions: ["undo", "new_game"],
+        });
       } else {
         sendError(res, "接口不存在", 404, "NOT_FOUND");
       }
@@ -241,6 +247,7 @@ function move(roomId, room, body) {
 
 function action(roomId, room, body) {
   const { playerId, action: actionName, requestId, expectedRevision } = body;
+  const normalizedAction = normalizeActionName(actionName);
   const side = requirePlayerSide(room, playerId);
   touchPlayer(room, playerId);
   const requestKey = prepareMutation(room, playerId, requestId, expectedRevision);
@@ -248,15 +255,13 @@ function action(roomId, room, body) {
     return snapshot(roomId, room, playerId, side, body.knownMoveCount);
   }
 
-  if (["undo", "draw"].includes(actionName)) {
-    requestAction(room, side, actionName);
-  } else if (actionName === "resign") {
-    resign(room, side);
-  } else if (actionName === "reset") {
-    reset(room);
-  } else if (actionName === "accept") {
+  if (normalizedAction === "undo") {
+    requestAction(room, side);
+  } else if (normalizedAction === "new_game") {
+    startNewGame(room);
+  } else if (normalizedAction === "accept") {
     acceptAction(room, side);
-  } else if (actionName === "reject") {
+  } else if (normalizedAction === "reject") {
     rejectAction(room, side);
   } else {
     throw new ApiError("INVALID_ACTION", "动作无效", 422);
@@ -267,18 +272,7 @@ function action(roomId, room, body) {
   return snapshot(roomId, room, playerId, side, body.knownMoveCount);
 }
 
-function resign(room, side) {
-  if (playerCount(room) < 2) {
-    throw new ApiError("WAITING_FOR_OPPONENT", "等待对手加入", 409);
-  }
-  if (room.status !== "PLAYING") {
-    throw new ApiError("GAME_FINISHED", "棋局已结束", 409);
-  }
-  room.status = side === "RED" ? "BLACK_WIN" : "RED_WIN";
-  room.pendingAction = null;
-}
-
-function reset(room) {
+function startNewGame(room) {
   if (playerCount(room) < 2) {
     throw new ApiError("WAITING_FOR_OPPONENT", "等待对手加入", 409);
   }
@@ -322,7 +316,7 @@ function snapshot(roomId, room, playerId, knownSide, fromMove = 0) {
   };
 }
 
-function requestAction(room, side, type) {
+function requestAction(room, side) {
   if (playerCount(room) < 2) {
     throw new ApiError("WAITING_FOR_OPPONENT", "等待对手加入", 409);
   }
@@ -332,18 +326,16 @@ function requestAction(room, side, type) {
   if (room.pendingAction) {
     throw new ApiError("ACTION_PENDING", "已有待处理请求", 409);
   }
-  if (type === "undo") {
-    if (room.moves.length === 0) {
-      throw new ApiError("NO_MOVE_TO_UNDO", "没有可悔棋步", 409);
-    }
-    if (lastMoveSide(room.moves.length) !== side) {
-      throw new ApiError("UNDO_NOT_ALLOWED", "只能请求撤回自己的上一步", 409);
-    }
+  if (room.moves.length === 0) {
+    throw new ApiError("NO_MOVE_TO_UNDO", "没有可悔棋步", 409);
+  }
+  if (lastMoveSide(room.moves.length) !== side) {
+    throw new ApiError("UNDO_NOT_ALLOWED", "只能请求撤回自己的上一步", 409);
   }
 
   room.actionReceipt = null;
   room.pendingAction = {
-    type,
+    type: "undo",
     requester: side,
     target: oppositeSide(side),
     createdAt: Date.now(),
@@ -359,12 +351,11 @@ function acceptAction(room, side) {
     throw new ApiError("ACTION_NOT_ALLOWED", "只能由对方处理请求", 403);
   }
 
-  if (pending.type === "undo") {
-    room.moves.pop();
-    rebuildRoomGame(room);
-  } else if (pending.type === "draw") {
-    room.status = "DRAW";
+  if (pending.type !== "undo") {
+    throw new ApiError("INVALID_PENDING_ACTION", "待处理请求无效", 409);
   }
+  room.moves.pop();
+  rebuildRoomGame(room);
   room.actionReceipt = {
     id: randomUUID(),
     type: pending.type,
@@ -449,7 +440,6 @@ function snapshotMessage(room, side) {
 
 function actionLabel(type) {
   if (type === "undo") return "悔棋";
-  if (type === "draw") return "求和";
   return "操作";
 }
 

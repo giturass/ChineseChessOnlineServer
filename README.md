@@ -28,7 +28,7 @@ Rooms are kept in process memory. For one Render instance this is enough for lig
 - `POST /api/rooms/{roomId}/move`
 - `POST /api/rooms/{roomId}/action`
 
-`undo` and `draw` create requests that the opponent accepts or rejects. `resign` and `reset` take effect immediately after the initiating player confirms them locally.
+The online control bar now exposes `undo`, a disabled client-side hint button, and `new_game`. `undo` creates a request that the opponent accepts or rejects. `new_game` starts a fresh game immediately after the initiating player confirms it locally. The legacy `reset` action remains accepted as an alias for compatibility with existing Android builds. `draw` and `resign` are no longer accepted.
 
 Move and action requests include a unique `requestId` and the client's `expectedRevision`. Duplicate requests are idempotent, while stale revisions return `REVISION_CONFLICT`.
 
